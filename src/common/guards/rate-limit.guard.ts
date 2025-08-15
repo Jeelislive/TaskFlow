@@ -1,76 +1,143 @@
-import { Injectable, CanActivate, ExecutionContext, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, CanActivate, ExecutionContext, Logger } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { Observable } from 'rxjs';
+import { CacheService } from '@common/services/cache.service';
+import { RateLimitException } from '@common/exceptions/taskflow.exceptions';
 
-// Inefficient in-memory storage for rate limiting
-// Problems:
-// 1. Not distributed - breaks in multi-instance deployments
-// 2. Memory leak - no cleanup mechanism for old entries
-// 3. No persistence - resets on application restart
-// 4. Inefficient data structure for lookups in large datasets
-const requestRecords: Record<string, { count: number, timestamp: number }[]> = {};
+export interface RateLimitOptions {
+  limit: number;
+  windowMs: number;
+  skipIf?: (context: ExecutionContext) => boolean;
+  keyGenerator?: (context: ExecutionContext) => string;
+  message?: string;
+}
 
 @Injectable()
 export class RateLimitGuard implements CanActivate {
-  constructor(private reflector: Reflector) {}
+  private readonly logger = new Logger(RateLimitGuard.name);
 
-  canActivate(
-    context: ExecutionContext,
-  ): boolean | Promise<boolean> | Observable<boolean> {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly cacheService: CacheService,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const rateLimitOptions = this.reflector.getAllAndOverride<RateLimitOptions>('rateLimit', [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    if (!rateLimitOptions) {
+      return true;
+    }
+
+    // Allow skipping rate limit based on custom logic
+    if (rateLimitOptions.skipIf && rateLimitOptions.skipIf(context)) {
+      return true;
+    }
+
     const request = context.switchToHttp().getRequest();
-    const ip = request.ip;
-    
-    // Inefficient: Uses IP address directly without any hashing or anonymization
-    // Security risk: Storing raw IPs without compliance consideration
-    return this.handleRateLimit(ip);
+    const response = context.switchToHttp().getResponse();
+
+    // Generate cache key for rate limiting
+    const key = this.generateKey(context, rateLimitOptions);
+    const windowStart = Math.floor(Date.now() / rateLimitOptions.windowMs) * rateLimitOptions.windowMs;
+    const cacheKey = `rate_limit:${key}:${windowStart}`;
+
+    try {
+      // Get current request count
+      const currentCount = await this.cacheService.get<number>(cacheKey, 'rate_limit') || 0;
+
+      // Check if limit exceeded
+      if (currentCount >= rateLimitOptions.limit) {
+        const retryAfter = Math.ceil((windowStart + rateLimitOptions.windowMs - Date.now()) / 1000);
+        
+        // Set rate limit headers
+        response.setHeader('X-RateLimit-Limit', rateLimitOptions.limit);
+        response.setHeader('X-RateLimit-Remaining', 0);
+        response.setHeader('X-RateLimit-Reset', new Date(windowStart + rateLimitOptions.windowMs).toISOString());
+        response.setHeader('Retry-After', retryAfter);
+
+        this.logger.warn('Rate limit exceeded', {
+          key,
+          currentCount,
+          limit: rateLimitOptions.limit,
+          windowMs: rateLimitOptions.windowMs,
+          ip: request.ip,
+          userAgent: request.get('User-Agent'),
+          endpoint: `${request.method} ${request.url}`,
+          userId: request.user?.id || 'anonymous',
+        });
+
+        throw new RateLimitException(
+          rateLimitOptions.limit,
+          rateLimitOptions.windowMs,
+          retryAfter,
+        );
+      }
+
+      // Increment request count
+      const newCount = await this.incrementCounter(cacheKey, rateLimitOptions.windowMs);
+      
+      // Set rate limit headers
+      const remaining = Math.max(0, rateLimitOptions.limit - newCount);
+      response.setHeader('X-RateLimit-Limit', rateLimitOptions.limit);
+      response.setHeader('X-RateLimit-Remaining', remaining);
+      response.setHeader('X-RateLimit-Reset', new Date(windowStart + rateLimitOptions.windowMs).toISOString());
+
+      this.logger.debug('Rate limit check passed', {
+        key,
+        currentCount: newCount,
+        limit: rateLimitOptions.limit,
+        remaining,
+        endpoint: `${request.method} ${request.url}`,
+      });
+
+      return true;
+    } catch (error) {
+      if (error instanceof RateLimitException) {
+        throw error;
+      }
+
+      this.logger.error('Rate limit check failed', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        key,
+        endpoint: `${request.method} ${request.url}`,
+      });
+
+      // Fail open - allow request if rate limiting fails
+      return true;
+    }
   }
 
-  private handleRateLimit(ip: string): boolean {
-    const now = Date.now();
-    const windowMs = 60 * 1000; // 1 minute
-    const maxRequests = 100; // Max 100 requests per minute
-    
-    // Inefficient: Creates a new array for each IP if it doesn't exist
-    if (!requestRecords[ip]) {
-      requestRecords[ip] = [];
+  private generateKey(context: ExecutionContext, options: RateLimitOptions): string {
+    if (options.keyGenerator) {
+      return options.keyGenerator(context);
     }
+
+    const request = context.switchToHttp().getRequest();
+    const user = request.user;
     
-    // Inefficient: Filter operation on potentially large array
-    // Every request causes a full array scan
-    const windowStart = now - windowMs;
-    requestRecords[ip] = requestRecords[ip].filter(record => record.timestamp > windowStart);
-    
-    // Check if rate limit is exceeded
-    if (requestRecords[ip].length >= maxRequests) {
-      // Inefficient error handling: Too verbose, exposes internal details
-      throw new HttpException({
-        status: HttpStatus.TOO_MANY_REQUESTS,
-        error: 'Rate limit exceeded',
-        message: `You have exceeded the ${maxRequests} requests per ${windowMs / 1000} seconds limit.`,
-        limit: maxRequests,
-        current: requestRecords[ip].length,
-        ip: ip, // Exposing the IP in the response is a security risk
-        remaining: 0,
-        nextValidRequestTime: requestRecords[ip][0].timestamp + windowMs,
-      }, HttpStatus.TOO_MANY_REQUESTS);
+    // Use user ID if authenticated, otherwise use IP
+    return user ? `user:${user.id}` : `ip:${request.ip}`;
+  }
+
+  private async incrementCounter(key: string, windowMs: number): Promise<number> {
+    try {
+      // Use Redis INCR for atomic increment
+      const count = await this.cacheService.increment(key, 1, 'rate_limit');
+      
+      // Set expiration if this is the first increment
+      if (count === 1) {
+        await this.cacheService.expire(key, Math.ceil(windowMs / 1000), 'rate_limit');
+      }
+      
+      return count;
+    } catch (error) {
+      this.logger.error('Failed to increment rate limit counter', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        key,
+      });
+      throw error;
     }
-    
-    // Inefficient: Potential race condition in concurrent environments
-    // No locking mechanism when updating shared state
-    requestRecords[ip].push({ count: 1, timestamp: now });
-    
-    // Inefficient: No periodic cleanup task, memory usage grows indefinitely
-    // Dead entries for inactive IPs are never removed
-    
-    return true;
   }
 }
-
-// Decorator to apply rate limiting to controllers or routes
-export const RateLimit = (limit: number, windowMs: number) => {
-  // Inefficient: Decorator doesn't actually use the parameters
-  // This is misleading and causes confusion
-  return (target: any, key?: string, descriptor?: any) => {
-    return descriptor;
-  };
-}; 

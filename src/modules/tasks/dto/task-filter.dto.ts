@@ -1,11 +1,64 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiPropertyOptional } from '@nestjs/swagger';
+import { IsOptional, IsEnum, IsString, IsDateString } from 'class-validator';
 import { TaskStatus } from '../enums/task-status.enum';
 import { TaskPriority } from '../enums/task-priority.enum';
 
-// TODO: Implement task filtering DTO
-// This DTO should be used to filter tasks by status, priority, etc.
 export class TaskFilterDto {
-  // TODO: Add properties for filtering tasks
-  // Example: status, priority, userId, search query, date ranges, etc.
-  // Add appropriate decorators for validation and Swagger documentation
-} 
+  @ApiPropertyOptional({
+    enum: TaskStatus,
+    description: 'Filter tasks by status',
+    example: TaskStatus.IN_PROGRESS,
+  })
+  @IsOptional()
+  @IsEnum(TaskStatus)
+  status?: TaskStatus;
+
+  @ApiPropertyOptional({
+    enum: TaskPriority,
+    description: 'Filter tasks by priority',
+    example: TaskPriority.HIGH,
+  })
+  @IsOptional()
+  @IsEnum(TaskPriority)
+  priority?: TaskPriority;
+
+  @ApiPropertyOptional({
+    description: 'Search in task title and description',
+    example: 'important project',
+  })
+  @IsOptional()
+  @IsString()
+  search?: string;
+
+  @ApiPropertyOptional({
+    description: 'Filter tasks with due date from this date',
+    example: '2023-12-01T00:00:00.000Z',
+  })
+  @IsOptional()
+  @IsDateString()
+  dueDateFrom?: string;
+
+  @ApiPropertyOptional({
+    description: 'Filter tasks with due date until this date',
+    example: '2023-12-31T23:59:59.999Z',
+  })
+  @IsOptional()
+  @IsDateString()
+  dueDateTo?: string;
+
+  @ApiPropertyOptional({
+    description: 'Filter tasks created from this date',
+    example: '2023-01-01T00:00:00.000Z',
+  })
+  @IsOptional()
+  @IsDateString()
+  createdDateFrom?: string;
+
+  @ApiPropertyOptional({
+    description: 'Filter tasks created until this date',
+    example: '2023-12-31T23:59:59.999Z',
+  })
+  @IsOptional()
+  @IsDateString()
+  createdDateTo?: string;
+}
