@@ -18,7 +18,7 @@ This is my implementation of the TaskFlow API coding challenge. I've transformed
 
 ### Docker Setup (Recommended)
 ```bash
-git clone <your-repo-url>
+git clone [<your-repo-url>](https://github.com/Jeelislive/TaskFlow)
 cd scriptassist-nestjs-exercise
 
 # Start all services
